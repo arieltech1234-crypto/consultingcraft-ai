@@ -316,11 +316,6 @@ if submitted:
                 "Live AI mode requires a Groq API key. Demo mode works without one."
             )
         else:
-            if visual_template_upload:
-                st.session_state.visual_template = visual_template_upload.getvalue()
-            else:
-                st.session_state.visual_template = None
-            
             with st.status("Running the evidence-to-draft workflow", expanded=True) as status:
                 try:
                     sections, meta = run_live_pipeline(
