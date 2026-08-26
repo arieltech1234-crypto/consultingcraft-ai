@@ -21,9 +21,9 @@ class CVGenerator:
             buffer = BytesIO(template_bytes)
             doc = DocxTemplate(buffer)
         else:
-            default_path = Path("src/demo_assets/default_template.docx")
+            default_path = Path("data/templates/isb_jinja_template.docx")
             if not default_path.exists():
-                raise FileNotFoundError("Default template not found. Please upload a visual template.")
+                raise FileNotFoundError("ISB template not found.")
             doc = DocxTemplate(str(default_path))
 
         # Re-structure context to simply pass the sections down

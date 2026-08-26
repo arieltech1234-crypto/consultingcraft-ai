@@ -99,13 +99,12 @@ def clear_old_draft_widgets() -> None:
 def run_live_pipeline(
     master_upload,
     reference_uploads,
-    structure_upload,
     api_key: str,
     min_words: int,
     max_words: int,
     layout_preferences: dict,
     status,
-) -> tuple[dict[str, list[str]], dict]:
+) -> tuple[dict, dict]:
     text_model, vision_model = resolve_models(api_key)
     ingester = DocumentIngester(api_key=api_key, vision_model=vision_model)
 
@@ -117,14 +116,8 @@ def run_live_pipeline(
         raise ValueError("No usable experience lines were found in the master CV.")
     status.write(f"Extracted {len(raw_lines)} evidence lines from the master CV.")
 
-    parser = TemplateParser()
-    if structure_upload is not None:
-        structure_bytes = structure_upload.getvalue()
-        validate_upload(structure_upload.name, structure_bytes)
-        template_sections = parser.parse_bytes(structure_bytes, structure_upload.name)
-    else:
-        template_sections = parser.default_sections()
-    status.write(f"Using {len(template_sections)} resume sections.")
+    template_sections = ["Education", "Internship", "Work Experience", "Extracurriculars"]
+    status.write(f"Using standard resume sections: {', '.join(template_sections)}.")
 
     reference_text_parts = []
     for uploaded_file in reference_uploads or []:
@@ -281,7 +274,7 @@ with st.form("build_inputs"):
 
     master_upload = None
     reference_uploads = []
-    structure_upload = None
+    
     upload_columns = st.columns(2)
     with upload_columns[0]:
         master_upload = st.file_uploader(
@@ -290,24 +283,12 @@ with st.form("build_inputs"):
             max_upload_size=8,
             help="Required. Processed in memory and not persisted by the app.",
         )
-        structure_upload = st.file_uploader(
-            "Optional section structure",
-            type=["docx"],
-            max_upload_size=8,
-            help="Uses the document's section names, not its visual design.",
-        )
     with upload_columns[1]:
         reference_uploads = st.file_uploader(
             "Job description or reference resumes",
             type=["docx", "pdf", "png", "jpg", "jpeg"],
             accept_multiple_files=True,
             max_upload_size=8,
-        )
-        visual_template_upload = st.file_uploader(
-            "Visual Template (.docx)",
-            type=["docx"],
-            max_upload_size=8,
-            help="Optional. A template with {{ name }} and {% for %} tags to inject bullets into your exact visual layout.",
         )
 
     submitted = st.form_submit_button(
@@ -345,7 +326,6 @@ if submitted:
                     sections, meta = run_live_pipeline(
                         master_upload,
                         reference_uploads,
-                        structure_upload,
                         api_key,
                         min_words,
                         max_words,
@@ -379,13 +359,45 @@ if st.session_state.draft_sections:
         "Constraint exceptions", meta.get("constraint_exceptions", 0)
     )
 
+    # Handle Rewrite Action
+    if st.session_state.get("pending_rewrite") is not None:
+        s_idx = st.session_state.pending_rewrite
+        st.session_state.pending_rewrite = None
+        api_key = configured_api_key()
+        text_model, _ = resolve_models(api_key)
+        
+        with st.spinner("Rewriting section bullets..."):
+            drafter = BulletDrafter(api_key=api_key, model_name=text_model)
+            optimizer = ConstraintOptimizer(api_key=api_key, model_name=text_model, max_iterations=2)
+            section_to_rewrite = st.session_state.draft_sections.sections[s_idx]
+            
+            for entry in section_to_rewrite.entries:
+                for group in entry.groups:
+                    if group.bullets:
+                        group.bullets = drafter.draft_bullets_batch(
+                            group.bullets, {}, min_words, max_words, section_context=section_to_rewrite.section_name
+                        )
+                        group.bullets = optimizer.optimize_batch(group.bullets, min_words, max_words)
+            st.session_state.generation_id += 1
+        st.rerun()
+
     # Reconstruct the schema based on user edits
     edited_schema = {"sections": []}
     generation_id = st.session_state.generation_id
     
     for s_idx, section in enumerate(st.session_state.draft_sections.sections):
         with st.container(border=True):
-            st.markdown(f"**{section.section_name}**")
+            col_title, col_rew, col_del = st.columns([6, 1, 1])
+            col_title.markdown(f"**{section.section_name}**")
+            
+            if col_rew.button("Rewrite", key=f"rew_{generation_id}_{s_idx}", use_container_width=True):
+                st.session_state.pending_rewrite = s_idx
+                st.rerun()
+            if col_del.button("Remove", key=f"del_{generation_id}_{s_idx}", use_container_width=True):
+                st.session_state.draft_sections.sections.pop(s_idx)
+                st.session_state.generation_id += 1
+                st.rerun()
+                
             edited_sec = {"section_name": section.section_name, "entries": []}
             
             for e_idx, entry in enumerate(section.entries):
@@ -422,6 +434,12 @@ if st.session_state.draft_sections:
                 edited_sec["entries"].append(edited_entry)
             edited_schema["sections"].append(edited_sec)
 
+    if st.button("+ Add New Section", key=f"add_sec_{generation_id}"):
+        from src.ai.schema import Section
+        st.session_state.draft_sections.sections.append(Section(section_name="New Section"))
+        st.session_state.generation_id += 1
+        st.rerun()
+
     current_hash = hashlib.sha256(
         json.dumps(edited_schema, sort_keys=True).encode("utf-8")
     ).hexdigest()
@@ -442,9 +460,8 @@ if st.session_state.draft_sections:
         )
 
     if export_clicked:
-        template_bytes = st.session_state.get("visual_template")
         document_bytes = CVGenerator().generate_docx_bytes(
-            structured_data, layout_preferences, template_bytes=template_bytes
+            structured_data, layout_preferences
         )
         calculator = PageBudgetCalculator(layout_preferences)
         estimate = calculator.estimate_fit(
