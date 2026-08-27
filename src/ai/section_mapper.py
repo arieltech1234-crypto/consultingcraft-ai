@@ -41,7 +41,7 @@ RULES:
 1. Map the text to the closest Target Section name.
 2. For each major entry, extract the left header (e.g., "Google | PM") and right header (e.g., "Aug 2021").
 3. Extract any short italicized or summary descriptions below the header into the `summary` field.
-4. Create a separate Group for sub-projects (e.g., "Project A"). If no sub-projects, put bullets in a single Group with empty group_name.
+4. DO NOT invent your own categories, groupings, or buckets! Keep all bullets together under a single Group with an empty `group_name` unless the original resume explicitly contains a literal sub-heading.
 5. Do NOT summarize or change the bullet points. Extract them exactly as written.
 
 RESUME TEXT CHUNK:
