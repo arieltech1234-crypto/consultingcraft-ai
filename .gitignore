@@ -11,3 +11,5 @@ data/
 *.docx
 
 !src/demo_assets/*.docx
+
+!data/templates/*.docx
