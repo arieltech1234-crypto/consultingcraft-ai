@@ -131,12 +131,25 @@ class DocumentIngester:
                     raise ValueError(f"Failed to process image after {max_retries} attempts: {e}")
         return ""
 
-    @staticmethod
-    def _find_vision_model(client: Groq) -> str | None:
+    # Known-good vision models, most preferred first. Falls back to a
+    # keyword match only when none of these are available for the key.
+    PREFERRED_VISION_MODELS = [
+        "meta-llama/llama-4-scout-17b-16e-instruct",
+        "meta-llama/llama-4-maverick-17b-128e-instruct",
+    ]
+
+    @classmethod
+    def _find_vision_model(cls, client: Groq) -> str | None:
         models = client.models.list().data
+        available = {model.id for model in models}
+
+        for preferred in cls.PREFERRED_VISION_MODELS:
+            if preferred in available:
+                return preferred
+
         candidates = [
-            model.id
-            for model in models
-            if any(token in model.id.lower() for token in ("vision", "vl", "scout", "qwen"))
+            model_id
+            for model_id in available
+            if any(token in model_id.lower() for token in ("vision", "vl", "scout", "qwen"))
         ]
-        return sorted(candidates, reverse=True)[0] if candidates else None
+        return sorted(candidates)[0] if candidates else None

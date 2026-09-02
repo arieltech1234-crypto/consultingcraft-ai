@@ -1,11 +1,14 @@
 
 __pycache__/
 *.pyc
+.pytest_cache/
 .streamlit/secrets.toml
 .venv/
 venv/
 env/
 .env
+.claude/
+temp/
 data/
 *.pdf
 *.docx

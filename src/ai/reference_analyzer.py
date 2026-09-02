@@ -3,10 +3,15 @@ ReferenceAnalyzer: Deep analysis of reference CVs.
 Extracts action verbs actually used, identifies example bullet patterns,
 finds similar experiences, and analyzes how they were structured.
 """
-from groq import Groq
 import json
+import logging
 import re
+
+from groq import Groq
+
 from .groq_chat import chat_completion
+
+logger = logging.getLogger(__name__)
 
 # Harvard Business School recommended action verbs for consulting resumes
 HARVARD_ACTION_VERBS = [
@@ -69,7 +74,7 @@ Be extremely specific. Do not give generic advice. Extract patterns from THIS sp
                 max_tokens=1500,
             )
             text = response.choices[0].message.content
-            print(f"DEBUG ReferenceAnalyzer response: {text[:300]}")
+            logger.debug("ReferenceAnalyzer response (truncated): %s", text[:300])
 
             try:
                 patterns = json.loads(text)
@@ -90,7 +95,7 @@ Be extremely specific. Do not give generic advice. Extract patterns from THIS sp
             return patterns
 
         except Exception as e:
-            print(f"Error in analyze: {e}")
+            logger.warning("ReferenceAnalyzer failed, using default patterns: %s", e)
             return self._default_patterns()
 
     def _default_patterns(self) -> dict:

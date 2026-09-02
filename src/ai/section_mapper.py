@@ -1,9 +1,15 @@
 """
 SectionMapper: Extracts a hierarchical resume schema from the raw Master CV text.
 """
+import logging
+import time
+
 import instructor
 from groq import Groq
+
 from .schema import ResumeSchema
+
+logger = logging.getLogger(__name__)
 
 class SectionMapper:
     def __init__(self, api_key: str, model_name: str = "llama-3.3-70b-versatile"):
@@ -20,14 +26,16 @@ class SectionMapper:
             return ResumeSchema(sections=[])
 
         lines = raw_text.split('\n')
-        chunk_size = 40
+        # A fixed line-count window can cut a logical block (e.g. an
+        # "Extracurriculars" entry) away from the heading that gives it
+        # context, which can make the model misassign it to the wrong
+        # target section. A larger window reduces the number of cut points
+        # without risking truncated JSON output from the model.
+        chunk_size = 60
         chunks = ['\n'.join(lines[i:i + chunk_size]) for i in range(0, len(lines), chunk_size)]
         
         merged_schema = ResumeSchema(sections=[])
-        
-        import time
-        import streamlit as st
-        
+
         for idx, chunk in enumerate(chunks):
             if not chunk.strip():
                 continue
@@ -74,7 +82,7 @@ RESUME TEXT CHUNK:
                         
             except Exception as e:
                 # If a chunk fails, log it and continue to the next chunk
-                print(f"SectionMapper Extraction Error on chunk {idx}: {e}")
+                logger.warning("SectionMapper extraction error on chunk %d: %s", idx, e)
                 
         return merged_schema
 

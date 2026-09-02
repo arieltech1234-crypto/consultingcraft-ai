@@ -19,9 +19,10 @@ def test_demo_mode_generates_editable_draft():
         default_timeout=20,
     )
     app.run()
-    generate = next(
-        button for button in app.button if button.label == "Generate tailored draft"
+    # "Portfolio demo (no API key)" is the default selected mode.
+    load_demo = next(
+        button for button in app.button if button.label == "Load demo draft"
     )
-    generate.click().run()
+    load_demo.click().run()
     assert not app.exception
     assert len(app.text_area) >= 8

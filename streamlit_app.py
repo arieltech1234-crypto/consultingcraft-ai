@@ -21,18 +21,24 @@ from ai.bullet_drafter import BulletDrafter
 from ai.bullet_selector import BulletSelector
 from ai.constraint_optimizer import ConstraintOptimizer
 from ai.ingestion import DocumentIngester
+from ai.jd_analyzer import JDAnalyzer, classify_reference_text, compute_jd_coverage
 from ai.reference_analyzer import HARVARD_ACTION_VERBS, ReferenceAnalyzer
 from ai.section_mapper import SectionMapper
-from ai.template_parser import TemplateParser
 from app_helpers import (
     build_contact_line,
     meaningful_lines,
     safe_download_stem,
     validate_upload,
 )
-from demo_content import DEMO_META, DEMO_PROFILE, DEMO_SECTIONS
+from ai.schema import ResumeSchema, prune_empty
+from demo_content import DEMO_META, DEMO_PROFILE, DEMO_RESUME_SCHEMA
 from layout.generator import CVGenerator
-from layout.page_budget import PageBudgetCalculator
+from layout.page_budget import (
+    MIN_LINE_SPACING_PT,
+    MIN_SECTION_SPACING_PT,
+    MIN_SUB_SECTION_SPACING_PT,
+    PageBudgetCalculator,
+)
 from layout.validation import validate_docx_pages
 
 
@@ -82,18 +88,71 @@ def resolve_models(api_key: str) -> tuple[str, str | None]:
             text_model = pref
             break
             
-    vision_candidates = [
-        model
-        for model in available
-        if any(token in model.lower() for token in ("vision", "vl", "scout"))
-    ]
-    return text_model, (sorted(vision_candidates)[0] if vision_candidates else None)
+    from ai.ingestion import DocumentIngester
+
+    vision_model = None
+    for preferred in DocumentIngester.PREFERRED_VISION_MODELS:
+        if preferred in available:
+            vision_model = preferred
+            break
+    if vision_model is None:
+        vision_candidates = [
+            model
+            for model in available
+            if any(token in model.lower() for token in ("vision", "vl", "scout", "qwen"))
+        ]
+        vision_model = sorted(vision_candidates)[0] if vision_candidates else None
+
+    return text_model, vision_model
 
 
 def clear_old_draft_widgets() -> None:
     for key in list(st.session_state):
         if str(key).startswith("draft_"):
             del st.session_state[key]
+
+
+def export_fitted_docx(
+    structured_data: dict, layout_preferences: dict, has_contact: bool, max_iterations: int = 40
+) -> tuple[bytes, dict, dict]:
+    """Render the DOCX and strictly enforce one page, tightening line spacing
+    first, then section spacing, then bullet spacing, down to a floor.
+
+    The fast layout estimate is only an approximation of real word-wrap
+    behavior (it doesn't know a real Word renderer's exact metrics), so
+    whenever a real renderer is available (`validate_docx_pages` finds
+    LibreOffice) each candidate spacing is checked against the REAL rendered
+    page count -- the authority here, not the heuristic -- so "fits one
+    page" means the exported file actually does.
+    """
+    prefs = dict(layout_preferences)
+    prefs.setdefault("font_size", 10)
+    prefs.setdefault("line_spacing_pt", float(prefs["font_size"]) + 1)
+    prefs.setdefault("section_spacing_pt", 6)
+    prefs.setdefault("sub_section_spacing_pt", 2.5)
+
+    schema_dict = structured_data.get("resume_schema", {})
+    generator = CVGenerator()
+    content = b""
+    report = {}
+
+    for _ in range(max_iterations):
+        content = generator.generate_docx_bytes(structured_data, prefs)
+        estimate = PageBudgetCalculator(prefs).estimate_fit(schema_dict, has_contact=has_contact)
+        report = validate_docx_pages(content, estimate)
+        if report["fits_one_page"]:
+            return content, prefs, report
+
+        if prefs["line_spacing_pt"] > MIN_LINE_SPACING_PT:
+            prefs["line_spacing_pt"] = round(max(MIN_LINE_SPACING_PT, prefs["line_spacing_pt"] - 0.5), 2)
+        elif prefs["section_spacing_pt"] > MIN_SECTION_SPACING_PT:
+            prefs["section_spacing_pt"] = round(max(MIN_SECTION_SPACING_PT, prefs["section_spacing_pt"] - 0.5), 2)
+        elif prefs["sub_section_spacing_pt"] > MIN_SUB_SECTION_SPACING_PT:
+            prefs["sub_section_spacing_pt"] = round(max(MIN_SUB_SECTION_SPACING_PT, prefs["sub_section_spacing_pt"] - 0.25), 2)
+        else:
+            break  # every spacing knob is at its floor; content must be trimmed instead
+
+    return content, prefs, report
 
 
 def run_live_pipeline(
@@ -119,24 +178,30 @@ def run_live_pipeline(
     template_sections = ["Education", "Internship", "Work Experience", "Extracurriculars"]
     status.write(f"Using standard resume sections: {', '.join(template_sections)}.")
 
-    reference_text_parts = []
+    reference_texts = []
     for uploaded_file in reference_uploads or []:
         content = uploaded_file.getvalue()
         validate_upload(uploaded_file.name, content)
-        reference_text_parts.append(ingester.extract_bytes(content, uploaded_file.name))
-    reference_text = "\n".join(reference_text_parts)
+        reference_texts.append(ingester.extract_bytes(content, uploaded_file.name))
+
+    # Each upload is auto-classified so a JD drives requirement alignment
+    # while a shortlisted reference resume drives writing-style modeling —
+    # they are not the same task and were previously conflated.
+    resume_texts = [t for t in reference_texts if t.strip() and classify_reference_text(t) == "resume"]
+    jd_texts = [t for t in reference_texts if t.strip() and classify_reference_text(t) == "jd"]
 
     mapper = SectionMapper(api_key=api_key, model_name=text_model)
     status.write("Extracting hierarchy and mapping evidence (processing chunks)...")
     mapped_schema = mapper.map_lines_to_sections(template_sections, master_text, status)
     status.write("✓ Mapped evidence to the target hierarchical resume structure.")
 
+    reference_text = "\n".join(resume_texts)
     if reference_text.strip():
-        status.write("Analyzing job description and writing style...")
+        status.write(f"Analyzing writing style from {len(resume_texts)} shortlisted reference resume(s)...")
         patterns = ReferenceAnalyzer(api_key=api_key, model_name=text_model).analyze(
             reference_text, master_text
         )
-        status.write("Analyzed the job description and reference writing style.")
+        status.write("✓ Analyzed the reference writing style.")
     else:
         patterns = {
             "all_recommended_verbs": HARVARD_ACTION_VERBS[:15],
@@ -148,14 +213,47 @@ def run_live_pipeline(
         }
         status.write("Applied the default evidence-led consulting style.")
 
-    # Target budget per section (Fallback to 5 per section for now until budget calculator is rewritten)
-    target_budget = 5 
+    jd_text = "\n".join(jd_texts)
+    jd_requirements = {}
+    if jd_text.strip():
+        status.write(f"Analyzing {len(jd_texts)} job description(s) for role requirements...")
+        jd_requirements = JDAnalyzer(api_key=api_key, model_name=text_model).analyze(jd_text)
+        status.write(
+            f"✓ Extracted {len(jd_requirements.get('required_skills', []))} required skills and "
+            f"{len(jd_requirements.get('keywords', []))} keywords from the job description."
+        )
+        patterns["jd_keywords"] = jd_requirements.get("keywords", [])
+
+    # Weighted per-section line budget (Work Experience gets more room than
+    # Extracurriculars, etc.) — converted to a bullet count. Each bullet is
+    # exactly one line (min_words/max_words above are sized to the real
+    # usable width), so 1 line per bullet, not an average-wraps guess --
+    # using 2 here would under-select by roughly half, leaving the page
+    # under-filled even though it isn't full.
+    section_names = [section.section_name for section in mapped_schema.sections]
+    budget_report = PageBudgetCalculator(layout_preferences).calculate_budget(section_names)
+    lines_per_bullet_estimate = 1
     selector = BulletSelector(api_key=api_key, model_name=text_model)
-    
+
+    target_themes = list(dict.fromkeys(
+        (patterns.get("key_themes") or [])
+        + (jd_requirements.get("required_skills") or [])
+        + (jd_requirements.get("keywords") or [])
+    ))
     selected_schema = mapped_schema
     for i, section in enumerate(selected_schema.sections):
-        status.write(f"Selecting best bullets for **{section.section_name}**...")
-        selected_schema.sections[i] = selector.select_best_lines(section, target_budget)
+        line_budget = budget_report["per_section_budget"].get(section.section_name, 5)
+        target_budget = max(3, round(line_budget / lines_per_bullet_estimate))
+        # A budget below the entry count guarantees at least one entry gets
+        # zero bullets and is pruned away entirely (e.g. a degree dropping
+        # out of Education). Every entry keeps at least one bullet.
+        target_budget = max(target_budget, len(section.entries))
+        status.write(f"Selecting best bullets for **{section.section_name}** (budget: {target_budget})...")
+        selected_schema.sections[i] = selector.select_best_lines(
+            section, target_budget, target_themes=target_themes
+        )
+
+    selected_schema = prune_empty(selected_schema)
         
     selected_count = sum(len(g.bullets) for s in selected_schema.sections for e in s.entries for g in e.groups)
     status.write(f"✓ Selected {selected_count} high-signal evidence lines.")
@@ -177,27 +275,67 @@ def run_live_pipeline(
     optimizer = ConstraintOptimizer(
         api_key=api_key, model_name=text_model, max_iterations=3
     )
-    
-    failing = 0
-    status.write("Running constraint optimization passes...")
+
+    # The real goal is each bullet reaching close to the right margin with
+    # no wrap -- word count is only an approximation of that (word length
+    # varies a lot: "led" vs. "orchestrated"), so this targets rendered
+    # character width directly, giving the model each bullet's precise
+    # current length so it can add or trim a measured amount rather than
+    # guess at a word-count proxy. One pass handles both "too short, leaves
+    # a gap at the margin" and "too long, wraps to a second line."
+    calculator = PageBudgetCalculator(layout_preferences)
+    min_chars, max_chars = calculator.target_character_band()
+    status.write(f"Fitting bullets to the printed line width ({min_chars}-{max_chars} characters)...")
+    auto_trimmed = 0
     for section in selected_schema.sections:
         for entry in section.entries:
             for group in entry.groups:
                 if group.bullets:
-                    group.bullets = optimizer.optimize_batch(group.bullets, min_words, max_words)
-                    failing += sum(1 for b in group.bullets if not min_words <= len(b.split()) <= max_words)
+                    before = list(group.bullets)
+                    group.bullets = optimizer.optimize_for_width(group.bullets, min_chars, max_chars)
+                    # A bullet the model could not get under the ceiling is
+                    # trimmed deterministically as a last resort. That trim
+                    # only ever removes a tail, so the result is a prefix of
+                    # what went in -- which is exactly how it's told apart
+                    # from a normal model rewrite, and flagged for review
+                    # rather than quietly shipping shortened text.
+                    auto_trimmed += sum(
+                        1
+                        for old, new in zip(before, group.bullets)
+                        if old != new and old.startswith(new.rstrip("."))
+                    )
 
-    status.write(
-        "✓ Completed three-pass constraint optimization."
-        if failing
-        else "All drafted bullets passed the configured word-count constraint."
+    multi_line_bullets = sum(
+        1
+        for section in selected_schema.sections
+        for entry in section.entries
+        for group in entry.groups
+        for bullet in group.bullets
+        if calculator.wrapped_line_count(bullet) > 1
     )
+    failing = multi_line_bullets
+    status.write(
+        f"⚠ {multi_line_bullets} bullet(s) still wrap to more than one line "
+        "-- shorten these manually in review for a strict one-liner layout."
+        if multi_line_bullets
+        else "✓ All bullets fit the line width without wrapping."
+    )
+    if auto_trimmed:
+        status.write(
+            f"ℹ {auto_trimmed} over-long bullet(s) were trimmed to fit one line "
+            "-- check these read well in review."
+        )
+
     return selected_schema, {
         "source_lines": len(raw_lines),
         "selected_lines": selected_count,
         "model": text_model,
         "reference_files": len(reference_uploads or []),
+        "reference_resumes_used": len(resume_texts),
+        "job_descriptions_used": len(jd_texts),
+        "jd_requirements": jd_requirements,
         "constraint_exceptions": failing,
+        "multi_line_bullets": multi_line_bullets,
         "pipeline": [
             "In-memory document ingestion",
             "Section mapping and evidence selection",
@@ -241,117 +379,176 @@ with value_columns[2].container(border=True, height="stretch"):
 
 with st.sidebar:
     st.header("Build settings")
-    font_size = st.slider("Font size", 9.0, 11.0, 10.0, 0.5)
-    side_margin = st.slider("Side margins (inches)", 0.4, 0.8, 0.55, 0.05)
-    vertical_margin = st.slider("Top and bottom margins (inches)", 0.4, 0.8, 0.5, 0.05)
-    max_words = int(24 - ((side_margin - 0.5) * 8))
-    min_words = max(14, max_words - 5)
-    st.caption(f"Target bullet length: {min_words}-{max_words} words")
+    # Defaults match the user's own working reference resume: 9pt Arial,
+    # 0.4in side margins, ~0.2in top/bottom margins.
+    font_size = st.slider("Font size", 8.0, 11.0, 9.0, 0.5)
+    side_margin = st.slider("Side margins (inches)", 0.3, 0.8, 0.4, 0.05)
+    vertical_margin = st.slider("Top and bottom margins (inches)", 0.15, 0.8, 0.2, 0.05)
 
 layout_preferences = {
     "font_size": font_size,
     "side_margin_inches": side_margin,
     "top_margin_inches": vertical_margin,
     "bottom_margin_inches": vertical_margin,
-    "line_spacing_pt": font_size + 1,
-    "section_spacing_pt": 6,
-    "sub_section_spacing_pt": 2.5,
+    # Dense, tight one-pager by default, matching the reference resume:
+    # "at least" line spacing pinned near zero (Word fills in whatever the
+    # font needs -- never clips, unlike a too-small "exactly" value) and
+    # zero paragraph spacing, since sections are separated by their header's
+    # background color, not whitespace.
+    "line_spacing_pt": MIN_LINE_SPACING_PT,
+    "section_spacing_pt": MIN_SECTION_SPACING_PT,
+    "sub_section_spacing_pt": MIN_SUB_SECTION_SPACING_PT,
 }
 
+with st.sidebar:
+    # Tied to the actual usable line width (not an arbitrary constant) so
+    # bullets are drafted to realistically fit one visual line -- the
+    # product wants strict one-liners, not bullets that wrap to two lines.
+    # A narrow min/max gap (not a wide range) matters here too: a wide
+    # range lets the model land anywhere in it, and shorter-word bullets
+    # can end well short of the right margin even at a "valid" word count,
+    # leaving visibly wasted trailing space on that line while neighboring
+    # bullets reach much closer to it. Keeping the band tight pushes every
+    # bullet toward the same width instead.
+    max_words = PageBudgetCalculator(layout_preferences).max_words_for_one_line()
+    min_words = max(6, max_words - 2)
+    st.caption(f"Target bullet length: {min_words}-{max_words} words (fits one line)")
+
 st.subheader("1. Provide evidence and context")
-with st.form("build_inputs"):
-    profile_columns = st.columns(2)
-    with profile_columns[0]:
-        name = st.text_input("Name", value=st.session_state.profile.get("name", ""))
-        location = st.text_input(
-            "Location", value=st.session_state.profile.get("location", "")
-        )
-    with profile_columns[1]:
-        phone = st.text_input("Phone", value=st.session_state.profile.get("phone", ""))
-        linkedin = st.text_input(
-            "LinkedIn", value=st.session_state.profile.get("linkedin", "")
-        )
+mode = st.radio(
+    "Mode",
+    ["Portfolio demo (no API key)", "Live AI mode"],
+    horizontal=True,
+    help=(
+        "Portfolio demo loads a fictitious draft instantly with no API key. "
+        "Live AI mode runs the staged LLM workflow on your uploaded CV."
+    ),
+)
 
-    master_upload = None
-    reference_uploads = []
-    
-    upload_columns = st.columns(2)
-    with upload_columns[0]:
-        master_upload = st.file_uploader(
-            "Master CV",
-            type=["docx", "pdf"],
-            max_upload_size=8,
-            help="Required. Processed in memory and not persisted by the app.",
-        )
-    with upload_columns[1]:
-        reference_uploads = st.file_uploader(
-            "Job description or reference resumes",
-            type=["docx", "pdf", "png", "jpg", "jpeg"],
-            accept_multiple_files=True,
-            max_upload_size=8,
-        )
-
-    submitted = st.form_submit_button(
-        "Generate tailored draft",
+if mode == "Portfolio demo (no API key)":
+    st.caption(
+        "Loads a fictitious candidate draft so the review, editing, and export "
+        "steps below can be tried without an API key or real documents."
+    )
+    demo_clicked = st.button(
+        "Load demo draft",
         type="primary",
         icon=":material/auto_awesome:",
         width="stretch",
     )
-
-if submitted:
-    profile = {
-        "name": name.strip(),
-        "phone": phone.strip(),
-        "location": location.strip(),
-        "linkedin": linkedin.strip(),
-    }
-    if not profile["name"]:
-        st.error("Add a candidate name before generating a draft.")
-    elif master_upload is None:
-        st.error("Upload a master CV to run the live AI workflow.")
-    else:
-        api_key = configured_api_key()
-        if not api_key:
-            st.error(
-                "Live AI mode requires a Groq API key. Demo mode works without one."
+    if demo_clicked:
+        clear_old_draft_widgets()
+        st.session_state.profile = copy.deepcopy(DEMO_PROFILE)
+        st.session_state.draft_sections = ResumeSchema(**copy.deepcopy(DEMO_RESUME_SCHEMA))
+        st.session_state.generation_meta = copy.deepcopy(DEMO_META)
+        st.session_state.generation_id += 1
+        st.session_state.output_bytes = None
+else:
+    with st.form("build_inputs"):
+        profile_columns = st.columns(2)
+        with profile_columns[0]:
+            name = st.text_input("Name", value=st.session_state.profile.get("name", ""))
+            location = st.text_input(
+                "Location", value=st.session_state.profile.get("location", "")
             )
+        with profile_columns[1]:
+            phone = st.text_input("Phone", value=st.session_state.profile.get("phone", ""))
+            linkedin = st.text_input(
+                "LinkedIn", value=st.session_state.profile.get("linkedin", "")
+            )
+
+        master_upload = None
+        reference_uploads = []
+
+        upload_columns = st.columns(2)
+        with upload_columns[0]:
+            master_upload = st.file_uploader(
+                "Master CV",
+                type=["docx", "pdf"],
+                max_upload_size=8,
+                help="Required. Processed in memory and not persisted by the app.",
+            )
+        with upload_columns[1]:
+            reference_uploads = st.file_uploader(
+                "Job description or reference resumes",
+                type=["docx", "pdf", "png", "jpg", "jpeg"],
+                accept_multiple_files=True,
+                max_upload_size=8,
+                help=(
+                    "Mix freely. Each file is auto-classified: a job description drives "
+                    "requirement alignment (see the coverage check after generation); a "
+                    "shortlisted reference resume drives writing-style modeling."
+                ),
+            )
+
+        submitted = st.form_submit_button(
+            "Generate tailored draft",
+            type="primary",
+            icon=":material/auto_awesome:",
+            width="stretch",
+        )
+
+    if submitted:
+        profile = {
+            "name": name.strip(),
+            "phone": phone.strip(),
+            "location": location.strip(),
+            "linkedin": linkedin.strip(),
+        }
+        if not profile["name"]:
+            st.error("Add a candidate name before generating a draft.")
+        elif master_upload is None:
+            st.error("Upload a master CV to run the live AI workflow.")
         else:
-            with st.status("Running the evidence-to-draft workflow", expanded=True) as status:
-                try:
-                    sections, meta = run_live_pipeline(
-                        master_upload,
-                        reference_uploads,
-                        api_key,
-                        min_words,
-                        max_words,
-                        layout_preferences,
-                        status,
-                    )
-                    clear_old_draft_widgets()
-                    st.session_state.profile = profile
-                    st.session_state.draft_sections = sections
-                    st.session_state.generation_meta = meta
-                    st.session_state.generation_id += 1
-                    st.session_state.output_bytes = None
-                    status.update(
-                        label="Draft ready for human review",
-                        state="complete",
-                        expanded=False,
-                    )
-                except Exception as error:
-                    status.update(
-                        label="Generation stopped safely", state="error", expanded=True
-                    )
-                    st.error(str(error))
+            api_key = configured_api_key()
+            if not api_key:
+                st.error(
+                    "Live AI mode requires a Groq API key. Portfolio demo mode works without one."
+                )
+            else:
+                with st.status("Running the evidence-to-draft workflow", expanded=True) as status:
+                    try:
+                        sections, meta = run_live_pipeline(
+                            master_upload,
+                            reference_uploads,
+                            api_key,
+                            min_words,
+                            max_words,
+                            layout_preferences,
+                            status,
+                        )
+                        clear_old_draft_widgets()
+                        st.session_state.profile = profile
+                        st.session_state.draft_sections = sections
+                        st.session_state.generation_meta = meta
+                        st.session_state.generation_id += 1
+                        st.session_state.output_bytes = None
+                        status.update(
+                            label="Draft ready for human review",
+                            state="complete",
+                            expanded=False,
+                        )
+                    except Exception as error:
+                        status.update(
+                            label="Generation stopped safely", state="error", expanded=True
+                        )
+                        st.error(str(error))
 
 if st.session_state.draft_sections:
     st.subheader("2. Review the evidence-led draft")
     meta = st.session_state.generation_meta or {}
-    metric_columns = st.columns(3)
+    metric_columns = st.columns(5)
     metric_columns[0].metric("Source evidence", meta.get("source_lines", 0))
     metric_columns[1].metric("Selected bullets", meta.get("selected_lines", 0))
     metric_columns[2].metric(
         "Constraint exceptions", meta.get("constraint_exceptions", 0)
+    )
+    metric_columns[3].metric(
+        "Bullets wrapping to 2+ lines", meta.get("multi_line_bullets", 0)
+    )
+    metric_columns[4].metric(
+        "Reference resumes / JDs used",
+        f"{meta.get('reference_resumes_used', 0)} / {meta.get('job_descriptions_used', 0)}",
     )
 
     # Handle Rewrite Action
@@ -364,15 +561,19 @@ if st.session_state.draft_sections:
         with st.spinner("Rewriting section bullets..."):
             drafter = BulletDrafter(api_key=api_key, model_name=text_model)
             optimizer = ConstraintOptimizer(api_key=api_key, model_name=text_model, max_iterations=2)
+            calculator = PageBudgetCalculator(layout_preferences)
+            min_chars, max_chars = calculator.target_character_band()
             section_to_rewrite = st.session_state.draft_sections.sections[s_idx]
-            
+            jd_requirements = meta.get("jd_requirements") or {}
+            rewrite_tone_rules = {"jd_keywords": jd_requirements.get("keywords", [])}
+
             for entry in section_to_rewrite.entries:
                 for group in entry.groups:
                     if group.bullets:
                         group.bullets = drafter.draft_bullets_batch(
-                            group.bullets, {}, min_words, max_words, section_context=section_to_rewrite.section_name
+                            group.bullets, rewrite_tone_rules, min_words, max_words, section_context=section_to_rewrite.section_name
                         )
-                        group.bullets = optimizer.optimize_batch(group.bullets, min_words, max_words)
+                        group.bullets = optimizer.optimize_for_width(group.bullets, min_chars, max_chars)
             st.session_state.generation_id += 1
         st.rerun()
 
@@ -429,8 +630,39 @@ if st.session_state.draft_sections:
                 edited_sec["entries"].append(edited_entry)
             edited_schema["sections"].append(edited_sec)
 
+    jd_requirements = meta.get("jd_requirements") or {}
+    jd_terms = list(dict.fromkeys(
+        (jd_requirements.get("required_skills") or []) + (jd_requirements.get("keywords") or [])
+    ))
+    if jd_terms:
+        coverage = compute_jd_coverage(edited_schema, jd_requirements)
+        with st.expander(
+            f"Job description alignment — {len(coverage['covered'])}/{coverage['total']} terms reflected",
+            icon=":material/checklist:",
+            expanded=bool(coverage["missing"]),
+        ):
+            if jd_requirements.get("seniority"):
+                st.caption(f"Detected seniority: {jd_requirements['seniority']}")
+            cov_col, miss_col = st.columns(2)
+            with cov_col:
+                st.markdown("**Reflected in the draft**")
+                for term in coverage["covered"]:
+                    st.markdown(f":material/check_circle: {term}")
+                if not coverage["covered"]:
+                    st.caption("None yet.")
+            with miss_col:
+                st.markdown("**Not yet reflected**")
+                for term in coverage["missing"]:
+                    st.markdown(f":material/radio_button_unchecked: {term}")
+                if not coverage["missing"]:
+                    st.caption("All requirement terms are reflected.")
+            st.caption(
+                "Only add missing terms to bullets that are truthfully supported by your "
+                "master CV — do not fabricate skills to match the job description."
+            )
+
     if st.button("+ Add New Section", key=f"add_sec_{generation_id}"):
-        from src.ai.schema import Section
+        from ai.schema import Section
         st.session_state.draft_sections.sections.append(Section(section_name="New Section"))
         st.session_state.generation_id += 1
         st.rerun()
@@ -455,16 +687,18 @@ if st.session_state.draft_sections:
         )
 
     if export_clicked:
-        document_bytes = CVGenerator().generate_docx_bytes(
-            structured_data, layout_preferences
-        )
-        calculator = PageBudgetCalculator(layout_preferences)
-        estimate = calculator.estimate_fit(
-            edited_schema, has_contact=bool(contact_line)
-        )
+        # Strictly enforce one page: tighten line spacing (then section, then
+        # bullet spacing), re-rendering and checking the REAL page count
+        # (LibreOffice, when available) after each step rather than trusting
+        # the fast layout estimate alone.
+        with st.spinner("Fitting to one page..."):
+            document_bytes, tightened_preferences, report = export_fitted_docx(
+                structured_data, layout_preferences, has_contact=bool(contact_line)
+            )
         st.session_state.output_bytes = document_bytes
         st.session_state.output_hash = current_hash
-        st.session_state.fit_report = validate_docx_pages(document_bytes, estimate)
+        st.session_state.fit_report = report
+        st.session_state.applied_layout_preferences = tightened_preferences
 
     if (
         st.session_state.output_bytes is not None
@@ -478,10 +712,21 @@ if st.session_state.draft_sections:
                 icon=":material/check_circle:",
             )
         else:
+            pages = report["estimated_pages"]
+            cut_fraction = round(100 * (pages - 1) / pages / 5) * 5
             st.warning(
-                f"The current draft is likely {report['estimated_pages']} pages. "
-                "Shorten bullets or reduce spacing before sharing.",
+                f"Still {pages} pages ({report['method']}) even at the tightest spacing "
+                f"this tool will apply automatically. Line/section/bullet spacing is already at "
+                f"its floor -- the remaining content itself doesn't fit one page at this font "
+                f"size. Try removing or merging roughly {cut_fraction}% of the bullets below, "
+                "or reduce the font size in the sidebar.",
                 icon=":material/warning:",
+            )
+        applied = st.session_state.get("applied_layout_preferences") or {}
+        if applied and applied.get("line_spacing_pt") != layout_preferences.get("line_spacing_pt"):
+            st.caption(
+                f"Line spacing auto-tightened to {applied['line_spacing_pt']}pt "
+                f"(from {layout_preferences['line_spacing_pt']}pt) to fit one page."
             )
         st.caption(report["note"])
         filename = f"{safe_download_stem(st.session_state.profile['name'])}_tailored_CV.docx"
