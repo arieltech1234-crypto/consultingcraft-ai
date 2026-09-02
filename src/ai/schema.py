@@ -18,3 +18,18 @@ class Section(BaseModel):
 class ResumeSchema(BaseModel):
     sections: list[Section] = Field(default_factory=list, description="The list of sections making up the resume.")
 
+
+def prune_empty(schema: ResumeSchema) -> ResumeSchema:
+    """Drop groups/entries/sections left with zero bullets after selection.
+
+    Bullet selection operates on a section's total bullet budget, so an
+    individual entry or sub-group can legitimately end up with none. Left
+    in, those render as orphan headers with no content underneath.
+    """
+    for section in schema.sections:
+        for entry in section.entries:
+            entry.groups = [group for group in entry.groups if group.bullets]
+        section.entries = [entry for entry in section.entries if entry.groups]
+    schema.sections = [section for section in schema.sections if section.entries]
+    return schema
+
